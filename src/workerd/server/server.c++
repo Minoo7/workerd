@@ -70,6 +70,10 @@
 #include <cstring>
 #endif
 
+#if WD_EXECUTOR_TCMALLOC
+#include "tcmalloc/malloc_extension.h"
+#endif
+
 namespace workerd::server {
 
 // Escape a string value for embedding in a JSON string literal. Returns the escaped text
@@ -5608,6 +5612,38 @@ void Server::unlinkWorkerLoaders() {
 //
 // All of this is off unless configured in `Config.memory`.
 
+// Starts TCMalloc's background actions thread with the given release rate. Upstream workerd never
+// calls MallocExtension::ProcessBackgroundActions(), so TCMalloc's background release rate has no
+// effect and free pages stay cached in the page heap for the life of the process.
+static void startTcmallocBackgroundRelease(uint64_t bytesPerSecond) {
+  if (bytesPerSecond == 0) return;
+#if WD_EXECUTOR_TCMALLOC
+  static bool started = false;
+  if (started) return;
+  if (!tcmalloc::MallocExtension::NeedsProcessBackgroundActions()) {
+    KJ_LOG(WARNING, "executor: TCMalloc does not need background actions here; not starting them");
+    return;
+  }
+  started = true;
+  tcmalloc::MallocExtension::SetBackgroundReleaseRate(
+      static_cast<tcmalloc::MallocExtension::BytesPerSecond>(bytesPerSecond));
+  kj::Thread thread([]() { tcmalloc::MallocExtension::ProcessBackgroundActions(); });
+  thread.detach();
+  KJ_LOG(INFO, "executor: TCMalloc background release enabled", bytesPerSecond);
+#else
+  KJ_LOG(WARNING,
+      "executor: memory.tcmallocBackgroundReleaseBytesPerSecond is set but this build does not use "
+      "TCMalloc; ignoring it");
+#endif
+}
+
+// Returns all free memory cached in TCMalloc's page heap to the OS. No-op without TCMalloc.
+static void releaseFreeMallocMemory() {
+#if WD_EXECUTOR_TCMALLOC
+  tcmalloc::MallocExtension::ReleaseMemoryToSystem(kj::maxValue);
+#endif
+}
+
 class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
  public:
   MemoryMaintenance(Server& server, config::MemoryOptions::Reader conf)
@@ -5618,6 +5654,7 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
         idleTaskPump(conf.getIdleTaskPumpMs() * kj::MILLISECONDS),
         pressureThresholdBytes(conf.getPressureThresholdMb() * 1024 * 1024),
         pressureCooldown(conf.getPressureCooldownMs() * kj::MILLISECONDS),
+        releaseMemoryAfterGc(conf.getReleaseMemoryAfterGc()),
         nextPressureCollection(server.timer.now()),
         pumpTasks(*this) {}
 
@@ -5668,7 +5705,11 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   kj::Duration idleTaskPump;
   uint64_t pressureThresholdBytes;
   kj::Duration pressureCooldown;
+  bool releaseMemoryAfterGc;
   kj::TimePoint nextPressureCollection;
+
+  // Set when a collection finished since the last time free malloc memory was released.
+  bool releasePending = false;
 
   kj::Vector<kj::Rc<IsolateEntry>> isolates;
   kj::TaskSet pumpTasks;
@@ -5722,6 +5763,15 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
         }
       }
     }
+
+    // Collections free V8 heap pages directly, but native objects owned by collected JavaScript
+    // objects go back to TCMalloc, which keeps them cached. Hand that memory back to the OS
+    // once per sweep at most.
+    if (releasePending && releaseMemoryAfterGc) {
+      releaseFreeMallocMemory();
+      KJ_LOG(INFO, "executor: released free malloc memory to the OS");
+    }
+    releasePending = false;
   }
 
   kj::Promise<void> collectIdle(kj::Rc<IsolateEntry> entry) {
@@ -5753,6 +5803,7 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
       entry->lastLockCount = isolate->getLockSuccessCount();
     }
     entry->collected = true;
+    releasePending = true;
     KJ_LOG(INFO, "executor: collected idle isolate", entry->name, full ? "full" : "moderate");
 
     if (idleTaskPump > 0 * kj::MILLISECONDS && !entry->pumping) {
@@ -5767,7 +5818,11 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   // at first; the memory reducer posts follow-ups seconds apart, so then fall back to the
   // maintenance interval.
   kj::Promise<void> pumpWhileIdle(kj::Rc<IsolateEntry> entry, kj::TimePoint until) {
-    KJ_DEFER(entry->pumping = false);
+    KJ_DEFER({
+      entry->pumping = false;
+      // A moderate collection completes during the pumping, so release afterwards as well.
+      releasePending = true;
+    });
     auto burstEnd = server.timer.now() + 2 * kj::SECONDS;
     while (server.timer.now() < until) {
       co_await server.timer.afterDelay(
@@ -5806,6 +5861,7 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
         pumpForegroundTasks(js);
       });
       entry->lastLockCount = isolate->getLockSuccessCount();
+      releasePending = true;
       if (!wasIdle) {
         entry->lastActive = server.timer.now();
         entry->collected = false;
@@ -7463,6 +7519,10 @@ kj::Promise<void> Server::run(
   auto forkedDrainWhen = handleDrain(kj::mv(drainWhen)).fork();
 
   co_await bindSockets(config);
+
+  if (config.hasMemory()) {
+    startTcmallocBackgroundRelease(config.getMemory().getTcmallocBackgroundReleaseBytesPerSecond());
+  }
 
   // Executor fork: start memory maintenance before any isolate is created, so that every isolate
   // gets registered with it.
