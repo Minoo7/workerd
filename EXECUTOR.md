@@ -45,3 +45,10 @@ from that artifact with `gh release create`, or use the `from_run` input once pu
 
 The build uses standard GitHub-hosted runners and the Actions cache for Bazel's disk cache; there
 is no remote cache. A cold build takes about two hours.
+
+## Downstream cancellation backport
+
+The isolated `fix/executor-response-pump-cancellation` branch backports upstream
+`24665358e90e5cccf0728e5ca133e50710832804` onto `caf569c512`, with its native
+regressions added to the two-architecture release gate. Candidate builds are not
+production Executor deployment or packaged-host acceptance.
