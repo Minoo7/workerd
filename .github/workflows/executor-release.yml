@@ -84,6 +84,12 @@ jobs:
           cp bazel-bin/src/workerd/server/workerd /tmp/workerd
           /tmp/workerd --version
           bash .github/executor/smoke-test.sh /tmp/workerd
+      - name: Stream cancellation regression tests
+        run: |
+          env -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT \
+          bazel test --config=ci --config=ci-linux-common --config=release_linux --strip=always \
+            --local_resources=memory=HOST_RAM*.8 --test_output=errors \
+            //src/workerd/api:streams/standard-test@ //src/workerd/server:server-test@
       - name: Upload binary
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v7
